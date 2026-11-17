@@ -1,16 +1,194 @@
 import nodemailer from 'nodemailer';
 import { SESv2Client, SendEmailCommand } from '@aws-sdk/client-sesv2';
+import axios from 'axios';
 import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// Load .env from current dir and backend dir if not already loaded
 dotenv.config();
+dotenv.config({ path: path.resolve(__dirname, '../.env') });
+dotenv.config({ path: path.resolve(__dirname, '.env') });
 
 // Helper to get sender email address
 export const getSenderEmail = () => {
-  return process.env.EMAIL_FROM || process.env.EMAIL_USER || 'info@zynith-it.com';
+  return (
+    process.env.DEFAULT_FROM_EMAIL ||
+    process.env.EMAIL_HOST_USER ||
+    process.env.EMAIL_FROM ||
+    process.env.EMAIL_USER ||
+    'admin@zynith-it.com'
+  );
+};
+
+// Check if an email address domain is allowed by ALLOWED_EMAIL_DOMAINS whitelist
+export const isEmailDomainAllowed = (email) => {
+  if (!email || typeof email !== 'string') return false;
+  const rawAllowed = process.env.ALLOWED_EMAIL_DOMAINS;
+  if (!rawAllowed || rawAllowed.trim() === '' || rawAllowed.trim() === '*') {
+    return true;
+  }
+  const allowedList = rawAllowed
+    .split(',')
+    .map(d => d.trim().toLowerCase())
+    .filter(Boolean);
+
+  if (allowedList.length === 0) return true;
+
+  const domain = email.split('@')[1]?.toLowerCase();
+  return domain ? allowedList.includes(domain) : false;
+};
+
+// Determine the active email provider
+export const getActiveEmailProvider = () => {
+  const provider = (process.env.EMAIL_PROVIDER || '').toLowerCase();
+  if (provider === 'office365' || provider === 'azure' || provider === 'microsoft') {
+    return 'office365';
+  }
+  if (provider === 'ses' || provider === 'aws') {
+    return 'ses';
+  }
+  if (provider === 'smtp' || provider === 'gmail') {
+    return 'smtp';
+  }
+
+  // If EMAIL_BACKEND is set to Office365 backend
+  if (process.env.EMAIL_BACKEND && process.env.EMAIL_BACKEND.toLowerCase().includes('office365')) {
+    return 'office365';
+  }
+
+  // Auto-detect Office 365 / Azure AD credentials
+  if (
+    process.env.AZURE_TENANT_ID &&
+    process.env.AZURE_CLIENT_ID &&
+    process.env.AZURE_CLIENT_SECRET &&
+    !process.env.AZURE_TENANT_ID.includes('###')
+  ) {
+    return 'office365';
+  }
+
+  return 'smtp';
+};
+
+// In-memory cache for Azure AD access token
+let cachedAzureToken = null;
+let azureTokenExpiresAt = 0;
+
+// Acquire access token from Azure AD using OAuth2 Client Credentials
+export const getAzureAccessToken = async () => {
+  const now = Date.now();
+  // Reuse valid token with 60s safety buffer
+  if (cachedAzureToken && azureTokenExpiresAt > now + 60000) {
+    return cachedAzureToken;
+  }
+
+  const tenantId = process.env.AZURE_TENANT_ID;
+  const clientId = process.env.AZURE_CLIENT_ID;
+  const clientSecret = process.env.AZURE_CLIENT_SECRET;
+
+  if (!tenantId || !clientId || !clientSecret) {
+    throw new Error('Azure AD credentials missing: AZURE_TENANT_ID, AZURE_CLIENT_ID, and AZURE_CLIENT_SECRET are required.');
+  }
+
+  if (tenantId.includes('###') || clientId.includes('###') || clientSecret.includes('###')) {
+    throw new Error('Azure AD credentials in .env contain placeholder values (###). Please provide actual credentials.');
+  }
+
+  const tokenUrl = `https://login.microsoftonline.com/${tenantId}/oauth2/v2.0/token`;
+
+  const bodyParams = new URLSearchParams();
+  bodyParams.append('client_id', clientId);
+  bodyParams.append('client_secret', clientSecret);
+  bodyParams.append('grant_type', 'client_credentials');
+  bodyParams.append('scope', 'https://graph.microsoft.com/.default');
+
+  const response = await axios.post(tokenUrl, bodyParams.toString(), {
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded'
+    },
+    timeout: 10000
+  });
+
+  if (!response.data || !response.data.access_token) {
+    throw new Error('Failed to acquire access token from Azure AD: response missing access_token');
+  }
+
+  cachedAzureToken = response.data.access_token;
+  azureTokenExpiresAt = now + ((response.data.expires_in || 3600) * 1000);
+  return cachedAzureToken;
+};
+
+// Send email via Microsoft Graph API (Office 365)
+export const sendViaOffice365Graph = async (mailOptions) => {
+  const token = await getAzureAccessToken();
+  const senderEmail = process.env.EMAIL_HOST_USER || process.env.DEFAULT_FROM_EMAIL || getSenderEmail();
+
+  // Normalize recipient(s)
+  let recipients = [];
+  if (Array.isArray(mailOptions.to)) {
+    recipients = mailOptions.to;
+  } else if (typeof mailOptions.to === 'string') {
+    recipients = mailOptions.to.split(',').map(s => s.trim()).filter(Boolean);
+  }
+
+  const toRecipients = recipients.map(address => ({
+    emailAddress: { address }
+  }));
+
+  const message = {
+    subject: mailOptions.subject,
+    body: {
+      contentType: mailOptions.html ? 'HTML' : 'Text',
+      content: mailOptions.html || mailOptions.text || ''
+    },
+    toRecipients
+  };
+
+  // Support attachments if provided
+  if (mailOptions.attachments && Array.isArray(mailOptions.attachments) && mailOptions.attachments.length > 0) {
+    message.attachments = mailOptions.attachments.map(att => {
+      let contentBytes = '';
+      if (Buffer.isBuffer(att.content)) {
+        contentBytes = att.content.toString('base64');
+      } else if (typeof att.content === 'string') {
+        contentBytes = Buffer.from(att.content).toString('base64');
+      }
+      return {
+        '@odata.type': '#microsoft.graph.fileAttachment',
+        name: att.filename || 'attachment',
+        contentType: att.contentType || 'application/octet-stream',
+        contentBytes
+      };
+    });
+  }
+
+  const graphUrl = `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(senderEmail)}/sendMail`;
+
+  const response = await axios.post(
+    graphUrl,
+    {
+      message,
+      saveToSentItems: true
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      },
+      timeout: 15000
+    }
+  );
+
+  const messageId = response.headers?.['client-request-id'] || `office365-${Date.now()}`;
+  console.log(`✅ Office 365 Graph email sent successfully (Message ID: ${messageId})`);
+  return { success: true, messageId };
 };
 
 // Create transporter (AWS SES when EMAIL_PROVIDER=ses, otherwise standard SMTP/Gmail)
-const createTransporter = () => {
+export const createTransporter = () => {
   const isSES = process.env.EMAIL_PROVIDER === 'ses';
 
   if (isSES) {
@@ -42,7 +220,6 @@ const createTransporter = () => {
   // Fallback to custom SMTP host & port
   return nodemailer.createTransport({
     service: process.env.EMAIL_SERVICE,
-    host: process.env.EMAIL_HOST,
     host: process.env.EMAIL_HOST || 'smtp.gmail.com',
     port: process.env.EMAIL_PORT ? parseInt(process.env.EMAIL_PORT, 10) : 587,
     secure: process.env.EMAIL_PORT === '465',
@@ -51,6 +228,43 @@ const createTransporter = () => {
       pass: process.env.EMAIL_PASS,
     },
   });
+};
+
+// Unified sendMail function that routes to the active provider (Office 365, SES, or SMTP)
+export const sendMail = async (mailOptions) => {
+  const recipient = Array.isArray(mailOptions.to) ? mailOptions.to[0] : mailOptions.to;
+
+  // Domain whitelist check
+  if (recipient && !isEmailDomainAllowed(recipient)) {
+    const domain = recipient.split('@')[1];
+    const errMsg = `Email domain "${domain}" for ${recipient} is not permitted in ALLOWED_EMAIL_DOMAINS`;
+    console.warn(`⚠️ [Email Blocked]: ${errMsg}`);
+    return { success: false, error: errMsg };
+  }
+
+  const provider = getActiveEmailProvider();
+  console.log(`📧 Dispatching email to "${recipient}" via [${provider.toUpperCase()}] | Subject: "${mailOptions.subject}"`);
+
+  if (provider === 'office365') {
+    try {
+      return await sendViaOffice365Graph(mailOptions);
+    } catch (graphError) {
+      const details = graphError.response?.data?.error?.message || graphError.message;
+      console.error(`❌ Office 365 Graph send failed:`, details);
+      return { success: false, error: `Office 365 send error: ${details}` };
+    }
+  }
+
+  // SES or standard SMTP
+  try {
+    const transporter = createTransporter();
+    const result = await transporter.sendMail(mailOptions);
+    console.log(`✅ Email sent successfully via [${provider.toUpperCase()}]:`, result.messageId);
+    return { success: true, messageId: result.messageId };
+  } catch (smtpError) {
+    console.error(`❌ Email send failed via [${provider.toUpperCase()}]:`, smtpError.message);
+    return { success: false, error: smtpError.message };
+  }
 };
 
 // Email template for employee credentials
@@ -146,12 +360,11 @@ const createEmployeeEmailTemplate = (employeeData, loginUrl) => {
 // Send employee credentials email
 export const sendEmployeeCredentials = async (employeeData, plainPassword) => {
   try {
-    const transporter = createTransporter();
     const loginUrl = `${process.env.FRONTEND_URL}/login`;
     
     const mailOptions = {
       from: {
-        name: 'Company HR System',
+        name: process.env.EMAIL_FROM_NAME || 'Company HR System',
         address: getSenderEmail()
       },
       to: employeeData.email,
@@ -178,24 +391,53 @@ Best regards,
 Company HR Team`
     };
 
-    const result = await transporter.sendMail(mailOptions);
-    console.log('Email sent successfully:', result.messageId);
-    return { success: true, messageId: result.messageId };
+    return await sendMail(mailOptions);
   } catch (error) {
-    console.error('Error sending email:', error);
+    console.error('Error sending employee credentials email:', error);
     return { success: false, error: error.message };
   }
 };
 
 // Test email configuration
 export const testEmailConfig = async () => {
+  const provider = getActiveEmailProvider();
+  console.log(`🔍 Testing email configuration using provider: [${provider.toUpperCase()}]`);
+
+  if (provider === 'office365') {
+    try {
+      console.log('1. Testing Azure AD OAuth2 Token Acquisition...');
+      const token = await getAzureAccessToken();
+      if (!token) throw new Error('Acquired Azure AD token was empty');
+      console.log('✅ Azure AD authentication successful (Token acquired)');
+
+      const sender = process.env.EMAIL_HOST_USER || process.env.DEFAULT_FROM_EMAIL || getSenderEmail();
+      console.log(`2. Verifying sending mailbox (${sender}) on Microsoft 365...`);
+      try {
+        const userCheck = await axios.get(
+          `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(sender)}?$select=id,mail,userPrincipalName`,
+          {
+            headers: { Authorization: `Bearer ${token}` },
+            timeout: 5000
+          }
+        );
+        console.log(`✅ Mailbox verified on Microsoft 365: ${userCheck.data?.mail || userCheck.data?.userPrincipalName}`);
+      } catch (userErr) {
+        console.warn(`⚠️ Mailbox lookup note (${userErr.response?.data?.error?.message || userErr.message}). (If permissions are restricted to Mail.Send only, mailbox lookup is expected to be restricted, but sending will still work).`);
+      }
+      return true;
+    } catch (error) {
+      console.error('❌ Office 365 / Azure AD config test error:', error.response?.data || error.message);
+      return false;
+    }
+  }
+
   try {
     const transporter = createTransporter();
     await transporter.verify();
-    console.log('Email configuration is correct');
+    console.log(`✅ Email configuration is correct for [${provider.toUpperCase()}]`);
     return true;
   } catch (error) {
-    console.error('Email configuration error:', error);
+    console.error(`❌ Email configuration error for [${provider.toUpperCase()}]:`, error);
     return false;
   }
 };
@@ -203,11 +445,9 @@ export const testEmailConfig = async () => {
 // Send payslip email
 export const sendPayslipEmail = async (payslip) => {
   try {
-    const transporter = createTransporter();
-    
     const mailOptions = {
       from: {
-        name: 'Zynith IT Solutions - HR',
+        name: process.env.EMAIL_FROM_NAME || 'Zynith IT Solutions - HR',
         address: getSenderEmail()
       },
       to: payslip.email,
@@ -229,9 +469,7 @@ Best regards,
 Zynith IT Solutions HR Team`
     };
 
-    const result = await transporter.sendMail(mailOptions);
-    console.log('Payslip email sent successfully:', result.messageId);
-    return { success: true, messageId: result.messageId };
+    return await sendMail(mailOptions);
   } catch (error) {
     console.error('Error sending payslip email:', error);
     return { success: false, error: error.message };
@@ -458,13 +696,12 @@ const createPasswordResetEmailTemplate = (resetUrl, user) => {
 // Send password reset email
 export const sendPasswordResetEmail = async (user, rawToken) => {
   try {
-    const transporter = createTransporter();
     const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
     const resetUrl = `${frontendUrl}/reset-password/${rawToken}`;
 
     const mailOptions = {
       from: {
-        name: 'Zynith IT Solutions - Security',
+        name: process.env.EMAIL_FROM_NAME || 'Zynith IT Solutions - Security',
         address: getSenderEmail()
       },
       to: user.email,
@@ -483,9 +720,7 @@ Best regards,
 Zynith IT Solutions Team`
     };
 
-    const result = await transporter.sendMail(mailOptions);
-    console.log('Password reset email sent successfully:', result.messageId);
-    return { success: true, messageId: result.messageId };
+    return await sendMail(mailOptions);
   } catch (error) {
     console.error('Error sending password reset email:', error);
     return { success: false, error: error.message };
